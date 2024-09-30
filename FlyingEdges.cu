@@ -8,6 +8,15 @@
 #include <vector>
 #include <stdexcept>
 
+#define cudaCheckError() { \
+    cudaError_t e=cudaGetLastError(); \
+    if(e!=cudaSuccess) { \
+        printf("Cuda failure %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(e)); \
+        exit(0); \
+    } \
+}
+
+
 // To be honest, I still prefer put all the vertexes into memory at 1 load.
 // Just because the dataset is not huge yet, thus can be easily handled for several GB
 const int BLOCK_SIZE_X = 512;
@@ -610,6 +619,7 @@ __constant__ unsigned char
 // case 2: (i-1) o-----x (i) | (_,j,k+1)
 // case 3: (i-1) x-----x (i) | (_,j+1,k+1)
 // Here we use bit operation to minimize branch resource consumption
+
 template<typename T>
 __device__ int calculateEdgeCase(T left, T right, T isovalue) {
     int flag = ((right < isovalue) << 1) | (left < isovalue);
@@ -617,46 +627,30 @@ __device__ int calculateEdgeCase(T left, T right, T isovalue) {
     return flag;
 }
 
-// Every thread block is in charge of a single x-direction of vertexes
-template<typename T, int BLOCK_SIZE_X>
+template<typename T>
 __global__ void calculateEdgeCases(T *scalars, T isovalue, int *edgeCases, dim3 dataShape) {
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int k = blockIdx.z * blockDim.z + threadIdx.z;
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y;
+    int z = blockIdx.z;
 
-    // No more beyond the boundary
-    if (j > (dataShape.y - 1) || k > (dataShape.z - 1)) {
+    // Check boundary conditions
+    if (x >= dataShape.x - 1 || y >= dataShape.y - 1 || z >= dataShape.z - 1) {
         return;
     }
 
-    // We need to figure out the exact shared memory volume
-    // We have num_vertexes = dataShape.x
-    // So finally we have num_edges = (num_vertex - 1)
-    __shared__ T sharedScalars[BLOCK_SIZE_X];
-    int baseIdx = j * dataShape.x + k * dataShape.x * dataShape.y;
+    // (dataShape.x-1) means the edge
+    int baseIdx = y * (dataShape.x - 1) + z * (dataShape.x - 1) * dataShape.y;
 
-    for (int blockStart = 0; blockStart < dataShape.x; blockStart += BLOCK_SIZE_X) {
-        // localIdx means the threadId, globalIdx means the id within shared memory, (baseIdx+globalIdx) means true global id for scalar indexing.
-        int localIdx = threadIdx.x;
-        int globalIdx = blockStart + localIdx;
+    // Read scalar values directly from global memory
+    T left = scalars[baseIdx + x];
+    T right = scalars[baseIdx + x + 1];
 
-        // Load data into shared memory
-        if (globalIdx < dataShape.x) {
-            sharedScalars[localIdx] = scalars[baseIdx + globalIdx];
-        }
+    // Calculate edge case
+    int edgeCase = calculateEdgeCase<T>(left, right, isovalue);
 
-        __syncthreads();
-
-        // Compute edge cases
-        // By setting boundary to avoid last case
-        if (globalIdx < dataShape.x - 1) {
-            T left = sharedScalars[globalIdx];
-            T right = sharedScalars[globalIdx + 1];
-
-            int edgeCase = calculateEdgeCase<T>(left, right, isovalue);
-            edgeCases[globalIdx + j * (dataShape.x - 1) + k * (dataShape.x - 1) * dataShape.y] = edgeCase;
-        }
-        __syncthreads();
-    }
+    // Write edge case to global memory
+    int edgeIndex = x + y * (dataShape.x - 1) + z * (dataShape.x - 1) * dataShape.y;
+    edgeCases[edgeIndex] = edgeCase;
 }
 
 // Every thread is in charge of calculating an x-direction vertexes to determine left and right trim pos.
@@ -684,92 +678,91 @@ __global__ void calculateTrimPositions(int *edgeCases, int *leftTrim, int *right
 }
 
 template<typename T, int BLOCK_SIZE_X>
-__global__ void Pass1(T *scalars, T isovalue, int *edgeCases, int *leftTrim, int *rightTrim, dim3 dataShape) {
-    dim3 gridSize((dataShape.x + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X, dataShape.y - 1, dataShape.z - 1);
-    dim3 blockSize(BLOCK_SIZE_X, 1, 1);
+void Pass1(T *scalars, T isovalue, int *edgeCases, int *leftTrim, int *rightTrim, dim3 dataShape) {
+    dim3 edgeCasesBlock(32, 16, 1);
+    dim3 edgeCasesGrid((dataShape.x - 1 + edgeCasesBlock.x - 1) / edgeCasesBlock.x,
+                       (dataShape.y + edgeCasesBlock.y - 1) / edgeCasesBlock.y,
+                       dataShape.z);
 
-    // Calculate edge cases
-    calculateEdgeCases<T, BLOCK_SIZE_X><<<gridSize, blockSize>>>(scalars, isovalue, edgeCases, dataShape);
+    calculateEdgeCases<<<edgeCasesGrid, edgeCasesBlock>>>(scalars, isovalue, edgeCases, dataShape);
 
-    // Calculate trim positions
-    dim3 trimGridSize(1, dataShape.y - 1, dataShape.z - 1);
-    calculateTrimPositions<<<trimGridSize, 1>>>(edgeCases, leftTrim, rightTrim, dataShape);
+    cudaDeviceSynchronize();
+
+    dim3 trimPosBlock(256, 1, 1);
+    dim3 trimPosGrid((dataShape.y + trimPosBlock.x - 1) / trimPosBlock.x, dataShape.z);
+
+    calculateTrimPositions<<<trimPosGrid, trimPosBlock>>>(edgeCases, leftTrim, rightTrim, dataShape);
+
+    cudaDeviceSynchronize();
 }
 
 __device__ int getCubeCase(int ec0, int ec1, int ec2, int ec3) {
     unsigned char caseId = 0;
-    if ((ec0 == 0) || (ec0 == 2)) // 0
-        caseId |= 1;
-    if ((ec0 == 0) || (ec0 == 1)) // 1
-        caseId |= 2;
-    if ((ec1 == 0) || (ec1 == 1)) // 2
-        caseId |= 4;
-    if ((ec1 == 0) || (ec1 == 2)) // 3
-        caseId |= 8;
-    if ((ec2 == 0) || (ec2 == 2)) // 4
-        caseId |= 16;
-    if ((ec2 == 0) || (ec2 == 1)) // 5
-        caseId |= 32;
-    if ((ec3 == 0) || (ec3 == 1)) // 6
-        caseId |= 64;
-    if ((ec3 == 0) || (ec3 == 2)) // 7
-        caseId |= 128;
+    caseId |= ((ec0 == 0) | (ec0 == 2)) << 0;
+    caseId |= ((ec0 == 0) | (ec0 == 1)) << 1;
+    caseId |= ((ec1 == 0) | (ec1 == 1)) << 2;
+    caseId |= ((ec1 == 0) | (ec1 == 2)) << 3;
+    caseId |= ((ec2 == 0) | (ec2 == 2)) << 4;
+    caseId |= ((ec2 == 0) | (ec2 == 1)) << 5;
+    caseId |= ((ec3 == 0) | (ec3 == 1)) << 6;
+    caseId |= ((ec3 == 0) | (ec3 == 2)) << 7;
     return caseId;
 }
 
-__global__ void
-getCubeCases(int *cubeCases, int *edgeCases, int *left_c, int *right_c, int *leftTrim, int *rightTrim, dim3 dataShape) {
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int k = blockIdx.z * blockDim.z + threadIdx.z;
+__global__ void getCubeCases(const int *edgeCases,
+                             const int *leftTrim,
+                             const int *rightTrim,
+                             int *triCount,
+                             int *cubeCases,
+                             int *left_c,
+                             int *right_c,
+                             dim3 dataShape) {
+    const int j = blockIdx.y * blockDim.y + threadIdx.y;
+    const int k = blockIdx.z * blockDim.z + threadIdx.z;
 
-    if (j >= (dataShape.y - 1) || k >= (dataShape.z - 1)) {
-        return;
-    }
+    if (j >= (dataShape.y - 1) || k >= (dataShape.z - 1)) return;
 
-    left_c[j + k * (dataShape.y - 1)] = min(leftTrim[j + k * dataShape.y],
-                                            min(leftTrim[(j + 1) + k * dataShape.y],
-                                                min(leftTrim[j + (k + 1) * dataShape.y],
-                                                    leftTrim[(j + 1) + (k + 1) * dataShape.y])));
-    right_c[j + k * (dataShape.y - 1)] = min(rightTrim[j + k * dataShape.y],
-                                             min(rightTrim[(j + 1) + k * dataShape.y],
-                                                 min(rightTrim[j + (k + 1) * dataShape.y],
-                                                     rightTrim[(j + 1) + (k + 1) * dataShape.y])));
+    const int jk = j + k * dataShape.y;
+    const int jk_minus = j + k * (dataShape.y - 1);
 
-    for (int i = left_c[j + k * (dataShape.y - 1)]; i < right_c[j + k * (dataShape.y - 1)]; i++) {
-        int ec0 = edgeCases[i + j * (dataShape.x - 1) + k * (dataShape.x - 1) * dataShape.y];
-        int ec1 = edgeCases[i + (j + 1) * (dataShape.x - 1) + k * (dataShape.x - 1) * dataShape.y];
-        int ec2 = edgeCases[i + j * (dataShape.x - 1) + (k + 1) * (dataShape.x - 1) * dataShape.y];
-        int ec3 = edgeCases[i + (j + 1) * (dataShape.x - 1) + (k + 1) * (dataShape.x - 1) * dataShape.y];
+    // Compute left_c and right_c
+    left_c[jk_minus] = min(min(leftTrim[jk], leftTrim[jk + 1]),
+                           min(leftTrim[jk + dataShape.y], leftTrim[jk + dataShape.y + 1]));
+    right_c[jk_minus] = min(min(rightTrim[jk], rightTrim[jk + 1]),
+                            min(rightTrim[jk + dataShape.y], rightTrim[jk + dataShape.y + 1]));
 
-        cubeCases[i + j * (dataShape.x - 1) + k * (dataShape.x - 1) * (dataShape.y - 1)] = getCubeCase(ec0, ec1, ec2,
-                                                                                                       ec3);
-    }
-}
-
-__global__ void Pass2(int *edgeCases, int *leftTrim, int *rightTrim, int *triCount, int *cubeCases, dim3 dataShape) {
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int k = blockIdx.z * blockDim.z + threadIdx.z;
-
-    if (j >= (dataShape.y - 1) || k >= (dataShape.z - 1)) {
-        return;
-    }
-
-    int left = leftTrim[j + k * dataShape.y];
-    int right = rightTrim[j + k * dataShape.y];
+    const int left = left_c[jk_minus];
+    const int right = right_c[jk_minus];
 
     int localTriCount = 0;
-    for (int i = left; i < right; i++) {
-        int ec0 = edgeCases[i + j * (dataShape.x - 1) + k * (dataShape.x - 1) * dataShape.y];
-        int ec1 = edgeCases[i + (j + 1) * (dataShape.x - 1) + k * (dataShape.x - 1) * dataShape.y];
-        int ec2 = edgeCases[i + j * (dataShape.x - 1) + (k + 1) * (dataShape.x - 1) * dataShape.y];
-        int ec3 = edgeCases[i + (j + 1) * (dataShape.x - 1) + (k + 1) * (dataShape.x - 1) * dataShape.y];
+    const int stride_y = (dataShape.x - 1) * dataShape.y;
+    const int base_idx = j * (dataShape.x - 1) + k * stride_y;
 
-        int cubeCase = getCubeCase(ec0, ec1, ec2, ec3);
+    for (int i = left; i < right; ++i) {
+        const int idx = i + base_idx;
+        const int ec0 = edgeCases[idx];
+        const int ec1 = edgeCases[idx + (dataShape.x - 1)];
+        const int ec2 = edgeCases[idx + stride_y];
+        const int ec3 = edgeCases[idx + stride_y + (dataShape.x - 1)];
+
+        const unsigned char cubeCase = getCubeCase(ec0, ec1, ec2, ec3);
         cubeCases[i + j * (dataShape.x - 1) + k * (dataShape.x - 1) * (dataShape.y - 1)] = cubeCase;
         localTriCount += numTris[cubeCase];
     }
 
-    triCount[j + k * (dataShape.y - 1)] = localTriCount;
+    triCount[jk_minus] = localTriCount;
+}
+
+void Pass2(int *d_edgeCases, int *d_leftTrim, int *d_rightTrim, int *d_triCount,
+           int *d_cubeCases, int *d_left_c, int *d_right_c, dim3 dataShape) {
+    dim3 blockDim(1, 32, 32);
+    dim3 gridDim(1, (dataShape.y - 1 + blockDim.y - 1) / blockDim.y,
+                 (dataShape.z - 1 + blockDim.z - 1) / blockDim.z);
+
+    getCubeCases<<<gridDim, blockDim>>>(d_edgeCases, d_leftTrim, d_rightTrim, d_triCount,
+                                        d_cubeCases, d_left_c, d_right_c, dataShape);
+
+    cudaDeviceSynchronize();
 }
 
 
@@ -837,7 +830,7 @@ template<typename T>
 __device__ void interpolateVertex(float *vert, T isovalue,
                                   float x1, float y1, float z1, T val1,
                                   float x2, float y2, float z2, T val2) {
-    float mu = (isovalue - val1) / (val2 - val1);
+    T mu = (isovalue - val1) / (val2 - val1);
     vert[0] = x1 + mu * (x2 - x1);
     vert[1] = y1 + mu * (y2 - y1);
     vert[2] = z1 + mu * (z2 - z1);
@@ -845,7 +838,7 @@ __device__ void interpolateVertex(float *vert, T isovalue,
 
 template<typename T>
 __global__ void Pass4(
-        const float *scalars,
+        const T *scalars,
         const int *cubeCases,
         const int *triOffsets,
         Vertex *vertices,
@@ -889,11 +882,11 @@ __global__ void Pass4(
             interpolateVertex(
                     vertList[i], isovalue,
                     cubeVertices[v1][0], cubeVertices[v1][1], cubeVertices[v1][2],
-                    scalars[z*dataShape.x*dataShape.y + y*dataShape.x + x +
-                                (v1>>2)*dataShape.x*dataShape.y + ((v1&2)>>1)*dataShape.x + (v1&1)],
+                    scalars[z * dataShape.x * dataShape.y + y * dataShape.x + x +
+                            (v1 >> 2) * dataShape.x * dataShape.y + ((v1 & 2) >> 1) * dataShape.x + (v1 & 1)],
                     cubeVertices[v2][0], cubeVertices[v2][1], cubeVertices[v2][2],
-                    scalars[z*dataShape.x*dataShape.y + y*dataShape.x + x +
-                                (v2>>2)*dataShape.x*dataShape.y + ((v2&2)>>1)*dataShape.x + (v2&1)]
+                    scalars[z * dataShape.x * dataShape.y + y * dataShape.x + x +
+                            (v2 >> 2) * dataShape.x * dataShape.y + ((v2 & 2) >> 1) * dataShape.x + (v2 & 1)]
             );
         }
     }
@@ -903,7 +896,7 @@ __global__ void Pass4(
         int vertIndex = triIndex * 3;
 
         for (int j = 0; j < 3; ++j) {
-            int edgeIndex = caseTriangles[cubeCase][i*3 + j];
+            int edgeIndex = caseTriangles[cubeCase][i * 3 + j];
             vertices[vertIndex + j].x = vertList[edgeIndex][0];
             vertices[vertIndex + j].y = vertList[edgeIndex][1];
             vertices[vertIndex + j].z = vertList[edgeIndex][2];
@@ -914,6 +907,7 @@ __global__ void Pass4(
         triangles[triIndex].v3 = vertIndex + 2;
     }
 }
+
 
 template<typename T>
 std::vector <T> readF32File(const std::string &filename, std::size_t numElements) {
@@ -942,22 +936,19 @@ std::vector <T> readF32File(const std::string &filename, std::size_t numElements
 }
 
 int main() {
-    // 设置参数
     float isovalue = 10.5f;
     std::string filePath = "temperature.f32";
     size_t numElements = 512 * 512 * 512;
     dim3 dataShape(512, 512, 512);
 
-    // 读取数据
-    std::vector<float> hostScalars = readF32File<float>(filePath, numElements);
+    std::vector<float> host_scalars = readF32File<float>(filePath, numElements);
 
-    // 设置CUDA网格和块大小
     dim3 gridSize((dataShape.x - 1 + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X, dataShape.y - 1, dataShape.z - 1);
     dim3 blockSize(BLOCK_SIZE_X, 1, 1);
 
-    // 分配设备内存
     float *d_scalars;
     int *d_edgeCases, *d_cubeCases, *d_leftTrim, *d_rightTrim, *d_triCount, *d_triOffsets;
+    int *d_leftTrim_c, *d_rightTrim_c;
     int *d_totalTriangles;
     Vertex *d_vertices;
     Triangle *d_triangles;
@@ -967,44 +958,49 @@ int main() {
     cudaMalloc(&d_cubeCases, (dataShape.x - 1) * (dataShape.y - 1) * (dataShape.z - 1) * sizeof(int));
     cudaMalloc(&d_leftTrim, (dataShape.y - 1) * dataShape.z * sizeof(int));
     cudaMalloc(&d_rightTrim, (dataShape.y - 1) * dataShape.z * sizeof(int));
+    cudaMalloc(&d_leftTrim_c, (dataShape.y - 1) * (dataShape.z - 1) * sizeof(int));
+    cudaMalloc(&d_rightTrim_c, (dataShape.y - 1) * (dataShape.z - 1) * sizeof(int));
     cudaMalloc(&d_triCount, (dataShape.y - 1) * (dataShape.z - 1) * sizeof(int));
     cudaMalloc(&d_triOffsets, (dataShape.x - 1) * (dataShape.y - 1) * (dataShape.z - 1) * sizeof(int));
     cudaMalloc(&d_totalTriangles, sizeof(int));
+    cudaCheckError();
 
-    // 将数据复制到设备
-    cudaMemcpy(d_scalars, hostScalars.data(), numElements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_scalars, host_scalars.data(), numElements * sizeof(float), cudaMemcpyHostToDevice);
 
-    // 执行Pass1
-    Pass1<float, BLOCK_SIZE_X><<<gridSize, blockSize>>>(d_scalars, isovalue, d_edgeCases, d_leftTrim, d_rightTrim, dataShape);
+    Pass1<float, BLOCK_SIZE_X>(d_scalars, isovalue, d_edgeCases, d_leftTrim, d_rightTrim,
+                               dataShape);
+    cudaCheckError();
 
-    // 执行Pass2
-    Pass2<<<gridSize, blockSize>>>(d_edgeCases, d_leftTrim, d_rightTrim, d_triCount, d_cubeCases, dataShape);
+    Pass2(d_edgeCases, d_leftTrim, d_rightTrim, d_triCount, d_cubeCases, d_leftTrim_c, d_rightTrim_c, dataShape);
 
-    // 执行Pass3
+    cudaCheckError();
+
     int totalVoxels = (dataShape.x - 1) * (dataShape.y - 1) * (dataShape.z - 1);
     int numBlocks = (totalVoxels + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X;
-    Pass3<<<numBlocks, BLOCK_SIZE_X, BLOCK_SIZE_X * sizeof(int)>>>(d_triCount, d_triOffsets, d_totalTriangles, totalVoxels);
+    Pass3<<<numBlocks, BLOCK_SIZE_X, BLOCK_SIZE_X * sizeof(int)>>>(d_triCount, d_triOffsets, d_totalTriangles,
+                                                                   totalVoxels);
 
-    // 获取总三角形数量
+    cudaCheckError();
+
     int totalTriangles;
     cudaMemcpy(&totalTriangles, d_totalTriangles, sizeof(int), cudaMemcpyDeviceToHost);
 
-    // 为顶点和三角形分配内存
     cudaMalloc(&d_vertices, totalTriangles * 3 * sizeof(Vertex));
     cudaMalloc(&d_triangles, totalTriangles * sizeof(Triangle));
 
-    // 执行Pass4
-    Pass4<float><<<gridSize, blockSize>>>(d_scalars, d_cubeCases, d_triOffsets, d_vertices, d_triangles, isovalue, dataShape);
+    Pass4<float><<<gridSize, blockSize>>>(d_scalars, d_cubeCases, d_triOffsets, d_vertices, d_triangles, isovalue,
+                                          dataShape);
+    cudaCheckError();
+//     By checking error position, we can tell that it is really the pass4 that has error.
+// TODO: By debuging, we find that maybe triOffsets array has invalid number, which we will mainly solve for the next week
 
-    // 将结果复制回主机（如果需要）
-    std::vector<Vertex> hostVertices(totalTriangles * 3);
-    std::vector<Triangle> hostTriangles(totalTriangles);
+
+
+    std::vector <Vertex> hostVertices(totalTriangles * 3);
+    std::vector <Triangle> hostTriangles(totalTriangles);
     cudaMemcpy(hostVertices.data(), d_vertices, totalTriangles * 3 * sizeof(Vertex), cudaMemcpyDeviceToHost);
     cudaMemcpy(hostTriangles.data(), d_triangles, totalTriangles * sizeof(Triangle), cudaMemcpyDeviceToHost);
 
-    // 这里可以添加代码来处理或保存结果
-
-    // 清理设备内存
     cudaFree(d_scalars);
     cudaFree(d_edgeCases);
     cudaFree(d_cubeCases);
@@ -1015,8 +1011,8 @@ int main() {
     cudaFree(d_totalTriangles);
     cudaFree(d_vertices);
     cudaFree(d_triangles);
+    cudaCheckError();
 
-    // 检查CUDA错误
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
         std::cerr << "CUDA error: " << cudaGetErrorString(error) << std::endl;
