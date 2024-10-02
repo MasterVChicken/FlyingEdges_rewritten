@@ -20,3 +20,12 @@ compute-sanitizer --tool initcheck ./your_program
 # For memory leak
 compute-sanitizer --tool memcheck --leak-check full ./your_program
 ```
+
+How to enable debug on vGPU?
+```shell
+# Example on Ubuntu 22.04
+
+1. nvidia-smi -L
+2. Get UUID of vGPU: GPU-c140d6fa-8034-11ef-ba7d-3b939bc7f0f1
+3. All failed. Not working on JetStream2.
+```
