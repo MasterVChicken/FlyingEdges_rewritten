@@ -8,9 +8,9 @@
 #include <vector>
 #include <stdexcept>
 #include <stdio.h>
+#include <cub/device/device_scan.cuh>
 
 // TODO: Now we have finished basic functions. But there are still bugs causing number of generated triangles to be 0. We'll check it soon.
-
 
 // helper function to check CUDA error
 void checkCudaError(cudaError_t result, const char *func, const char *file, int line) {
@@ -26,6 +26,14 @@ void checkCudaError(cudaError_t result, const char *func, const char *file, int 
 #define BLOCK_SIZE 64
 #define MAX_THREADS_PER_BLOCK 512
 #define MAX_ELEMENTS_PER_BLOCK (MAX_THREADS_PER_BLOCK * 2)
+
+void print_int(int *data, int N) {
+    std::vector<int> host_data(N);
+    CHECK_CUDA(cudaMemcpy(host_data.data(), data, N * sizeof(int), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < 10000; i++) {
+        std::cout << "index: " << i << ": " << host_data[i] << std::endl;
+    }
+}
 
 struct Vertex {
     float x, y, z;
@@ -784,20 +792,12 @@ __global__ void writeCubeTriangles(int *cubeCases, int *d_cubes_tri, dim3 dataSh
     int x = threadIdx.x + blockIdx.x * blockDim.x;
     int y = threadIdx.y + blockIdx.y * blockDim.y;
     int z = threadIdx.z + blockIdx.z * blockDim.z;
+    int index = x + y * (dataShape.x - 1) + z * (dataShape.x - 1) * (dataShape.y - 1);
     if (x >= (dataShape.x - 1) || y >= (dataShape.y - 1) || z >= (dataShape.z - 1)) {
         return;
     }
 
-    d_cubes_tri[x + y * (dataShape.x - 1 + z * (dataShape.x - 1) * (dataShape.y - 1))] = numTris[d_cubes_tri[x + y *
-                                                                                                                 (dataShape.x -
-                                                                                                                  1) +
-                                                                                                             z *
-                                                                                                             (dataShape.x -
-                                                                                                              1) *
-                                                                                                             (dataShape.y -
-                                                                                                              1)]];
-
-    __syncthreads();
+    d_cubes_tri[index] = numTris[cubeCases[index]];
 }
 
 // ALL SAFE HERE!!!
@@ -814,176 +814,257 @@ void Pass2(int *d_edgeCases, int *d_leftTrim, int *d_rightTrim, int *d_triCount,
 
     cudaDeviceSynchronize();
 
-    writeCubeTriangles<<<(totalVoxels + MAX_THREADS_PER_BLOCK - 1) / MAX_THREADS_PER_BLOCK, MAX_THREADS_PER_BLOCK>>>(
-            d_cubeCases, d_cubes_tri, dataShape);
+    dim3 ThreadNum(64, 64, 64);
+    dim3 BlockNum = ((dataShape.x + 63) / 64, (dataShape.y + 63) / 64, (dataShape.z + 63) / 64);
+
+    writeCubeTriangles<<<BlockNum, ThreadNum>>>(d_cubeCases, d_cubes_tri, dataShape);
+    //  通过计算，我们可以确定这里没问题
+    // TODO:调用write函数可能有问题？
+
+    cudaDeviceSynchronize();
+    // OKAY, d_cubes_tri没拿到，全是空
+//    print_int(d_cubes_tri, totalVoxels);
 
     cudaDeviceSynchronize();
 }
 
+//__global__ void parallel_large_scan_kernel(int *data, int *prefix_sum, int N, int *sums) {
+//    __shared__ int tmp[MAX_ELEMENTS_PER_BLOCK];
+//    int tid = threadIdx.x;
+//    int bid = blockIdx.x;
+//    int block_offset = bid * MAX_ELEMENTS_PER_BLOCK;
+//    int leaf_num = MAX_ELEMENTS_PER_BLOCK;
+//
+//    tmp[tid * 2] = tid * 2 + block_offset < N ? data[tid * 2 + block_offset] : 0;
+//    tmp[tid * 2 + 1] = tid * 2 + 1 + block_offset < N ? data[tid * 2 + 1 + block_offset] : 0;
+//    __syncthreads();
+//
+//    int offset = 1;
+//    for (int d = leaf_num >> 1; d > 0; d >>= 1) {
+//        if (tid < d) {
+//            int ai = offset * (2 * tid + 1) - 1;
+//            int bi = offset * (2 * tid + 2) - 1;
+//            tmp[bi] += tmp[ai];
+//        }
+//        offset *= 2;
+//        __syncthreads();
+//    }
+//
+//    if (tid == 0) {
+//        sums[bid] = tmp[leaf_num - 1];
+//        tmp[leaf_num - 1] = 0;
+//    }
+//    __syncthreads();
+//
+//    for (int d = 1; d < leaf_num; d *= 2) {
+//        offset >>= 1;
+//        if (tid < d) {
+//            int ai = offset * (2 * tid + 1) - 1;
+//            int bi = offset * (2 * tid + 2) - 1;
+//
+//            int v = tmp[ai];
+//            tmp[ai] = tmp[bi];
+//            tmp[bi] += v;
+//        }
+//        __syncthreads();
+//    }
+//
+//    if (tid * 2 + block_offset < N) {
+//        prefix_sum[tid * 2 + block_offset] = tmp[tid * 2];
+//    }
+//    if (tid * 2 + 1 + block_offset < N) {
+//        prefix_sum[tid * 2 + 1 + block_offset] = tmp[tid * 2 + 1];
+//    }
+//}
+//
+//__global__ void add_kernel(int *prefix_sum, int *valus, int N) {
+//    int tid = threadIdx.x;
+//    int bid = blockIdx.x;
+//    int block_offset = bid * MAX_ELEMENTS_PER_BLOCK;
+//    int ai = tid + block_offset;
+//    int bi = tid + (MAX_ELEMENTS_PER_BLOCK >> 1) + block_offset;
+//
+//    if (ai < N) {
+//        prefix_sum[ai] += valus[bid];
+//    }
+//    if (bi < N) {
+//        prefix_sum[bi] += valus[bid];
+//    }
+//}
+//
+//void recursive_scan(int *d_data, int *d_prefix_sum, int N) {
+//    int block_num = N / MAX_ELEMENTS_PER_BLOCK;
+//    if (N % MAX_ELEMENTS_PER_BLOCK != 0) {
+//        block_num += 1;
+//    }
+//    int *d_sums, *d_sums_prefix_sum;  // 用来保存block数组和、数组和的前缀和
+//    cudaMalloc(&d_sums, block_num * sizeof(int));
+//    cudaMalloc(&d_sums_prefix_sum, block_num * sizeof(int));
+//
+//    parallel_large_scan_kernel<<<block_num, MAX_THREADS_PER_BLOCK>>>(d_data, d_prefix_sum, N, d_sums);
+//
+//    if (block_num != 1) {
+//        recursive_scan(d_sums, d_sums_prefix_sum, block_num);
+//        add_kernel<<<block_num, MAX_THREADS_PER_BLOCK>>>(d_prefix_sum, d_sums_prefix_sum, N);
+//    }
+//}
+//
+////__global__ void columnWisePrefixScan(const int *d_input, int *d_output, int column_size, int num_columns) {
+////    extern __shared__ int temp[];
+////    int tid = threadIdx.x;
+////    int column = blockIdx.x;
+////
+////    if (column >= num_columns) return;
+////
+////    // Load input into shared memory
+////    for (int i = tid; i < column_size; i += blockDim.x) {
+////        temp[i] = d_input[column * column_size + i];
+////    }
+////    __syncthreads();
+////
+////    // Perform inclusive scan
+////    for (int stride = 1; stride < column_size; stride *= 2) {
+////        int index = (tid + 1) * stride * 2 - 1;
+////        if (index < column_size) {
+////            temp[index] += temp[index - stride];
+////        }
+////        __syncthreads();
+////    }
+////
+////    // Write results to global memory
+////    for (int i = tid; i < column_size; i += blockDim.x) {
+////        d_output[column * column_size + i] = temp[i];
+////    }
+////
+////    // Debug output
+////    if (tid == 0 && column == 0) {
+////        printf("First column input: ");
+////        for (int i = 0; i < min(10, column_size); i++) {
+////            printf("%d ", d_input[i]);
+////        }
+////        printf("\nFirst column output: ");
+////        for (int i = 0; i < min(10, column_size); i++) {
+////            printf("%d ", temp[i]);
+////        }
+////        printf("\n");
+////    }
+////}
+//
+//void test(int *d_column_prefix_sum, int column_size, int num_columns) {
+//    std::vector<int> temp(column_size * num_columns);
+//    CHECK_CUDA(cudaMemcpy(temp.data(), d_column_prefix_sum, column_size * num_columns * sizeof(int),
+//                          cudaMemcpyDeviceToHost));
+//    for (int i = 0; i < 2; i++) {
+//        std::cout << "block" << ": " << i << std::endl;
+//        for (int j = 0; j < column_size; j++) {
+//            std::cout << "cell " << j << " : " << temp[i * column_size + j] << std::endl;
+//        }
+//    }
+//}
+//
+//__global__ void
+//combinePrefixSums(int *column_prefix_sum, int *global_prefix_sum, int *tri_offsets, int column_size, int num_columns) {
+//    int tid = threadIdx.x;
+//    int bid = blockIdx.x;
+//    int column = blockIdx.y;
+//    int local_id = bid * blockDim.x + tid;
+//    int global_id = column * column_size + local_id;
+//
+//    __shared__ int shared_global_sum;
+//
+//    if (tid == 0) {
+//        shared_global_sum = (column > 0) ? global_prefix_sum[column - 1] : 0;
+//    }
+//    __syncthreads();
+//
+//    if (column < num_columns && local_id < column_size) {
+//        int column_sum = column_prefix_sum[global_id];
+//        tri_offsets[global_id] = column_sum + shared_global_sum;
+//    }
+//}
+//
+//void Pass3(int *d_triCount, int *d_triOffsets, int *d_cubes_tri, dim3 dataShape) {
+//    int column_size = dataShape.x - 1;
+//    int num_columns = (dataShape.y - 1) * (dataShape.z - 1);
+//    int totalElements = column_size * num_columns;
+//
+//    // Step 1: Perform global prefix sum on d_triCount
+//    int *d_global_prefix_sum;
+//    CHECK_CUDA(cudaMalloc(&d_global_prefix_sum, num_columns * sizeof(int)));
+//    recursive_scan(d_triCount, d_global_prefix_sum, num_columns);
+//    CHECK_CUDA(cudaDeviceSynchronize());
+//    // 通过测试函数，我们已经确认d_global_prefix_sum的值没问题
+//
+//    // Step 2: Perform column-wise prefix sum
+//    int *d_column_prefix_sum;
+//    CHECK_CUDA(cudaMalloc(&d_column_prefix_sum, totalElements * sizeof(int)));
+//
+////    dim3 blockSize(256, 1, 1);
+////    dim3 gridSize(num_columns, 1, 1);
+////    int sharedMemSize = column_size * sizeof(int);
+////
+////    columnWisePrefixScan<<<gridSize, blockSize, sharedMemSize>>>(
+////            d_cubes_tri, d_column_prefix_sum, column_size, num_columns);
+////    test(d_column_prefix_sum, column_size, num_columns);
+//    // 通过测试函数，我们已经确认d_column_prefix_sum的值有大问题，目前来看值全部都是0，想个办法验证一下
+//    // 首先，我们返回到了pass2去检查d_cubes_tri有没有问题，答案是没有, 所以我们这里拿到的原始每个cube的三角形数量的数据是没问题的
+//    // 所以大概率问题出在columnWisePrefixScan函数内部，错误的处理导致返回值不对
+//
+//    recursive_scan(d_cubes_tri, d_column_prefix_sum, totalElements);
+//
+//    test(d_column_prefix_sum, column_size, num_columns);
+//
+//    CHECK_CUDA(cudaDeviceSynchronize());
+//
+////    dim3 blockSize1(256, 1, 1);
+////    dim3 gridSize1((column_size + blockSize.x - 1) / blockSize.x, num_columns, 1);
+////
+////    // Step 3: Combine global and column-wise prefix sums
+////    combinePrefixSums<<<gridSize1, blockSize1>>>(
+////            d_column_prefix_sum, d_global_prefix_sum, d_triOffsets, column_size, num_columns);
+////
+////    // Clean up
+//    CHECK_CUDA(cudaFree(d_global_prefix_sum));
+//    CHECK_CUDA(cudaFree(d_column_prefix_sum));
+////
+////    CHECK_CUDA(cudaDeviceSynchronize());
+//}
 
-__global__ void parallel_large_scan_kernel(int *data, int *prefix_sum, int N, int *sums) {
-    __shared__ int tmp[MAX_ELEMENTS_PER_BLOCK];
-    int tid = threadIdx.x;
-    int bid = blockIdx.x;
-    int block_offset = bid * MAX_ELEMENTS_PER_BLOCK;
-    int leaf_num = MAX_ELEMENTS_PER_BLOCK;
-
-    tmp[tid * 2] = tid * 2 + block_offset < N ? data[tid * 2 + block_offset] : 0;
-    tmp[tid * 2 + 1] = tid * 2 + 1 + block_offset < N ? data[tid * 2 + 1 + block_offset] : 0;
-    __syncthreads();
-
-    int offset = 1;
-    for (int d = leaf_num >> 1; d > 0; d >>= 1) {
-        if (tid < d) {
-            int ai = offset * (2 * tid + 1) - 1;
-            int bi = offset * (2 * tid + 2) - 1;
-            tmp[bi] += tmp[ai];
-        }
-        offset *= 2;
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        sums[bid] = tmp[leaf_num - 1];
-        tmp[leaf_num - 1] = 0;
-    }
-    __syncthreads();
-
-    for (int d = 1; d < leaf_num; d *= 2) {
-        offset >>= 1;
-        if (tid < d) {
-            int ai = offset * (2 * tid + 1) - 1;
-            int bi = offset * (2 * tid + 2) - 1;
-
-            int v = tmp[ai];
-            tmp[ai] = tmp[bi];
-            tmp[bi] += v;
-        }
-        __syncthreads();
-    }
-
-    if (tid * 2 + block_offset < N) {
-        prefix_sum[tid * 2 + block_offset] = tmp[tid * 2];
-    }
-    if (tid * 2 + 1 + block_offset < N) {
-        prefix_sum[tid * 2 + 1 + block_offset] = tmp[tid * 2 + 1];
-    }
-}
-
-__global__ void add_kernel(int *prefix_sum, int *valus, int N) {
-    int tid = threadIdx.x;
-    int bid = blockIdx.x;
-    int block_offset = bid * MAX_ELEMENTS_PER_BLOCK;
-    int ai = tid + block_offset;
-    int bi = tid + (MAX_ELEMENTS_PER_BLOCK >> 1) + block_offset;
-
-    if (ai < N) {
-        prefix_sum[ai] += valus[bid];
-    }
-    if (bi < N) {
-        prefix_sum[bi] += valus[bid];
-    }
-}
-
-void recursive_scan(int *d_data, int *d_prefix_sum, int N) {
-    int block_num = N / MAX_ELEMENTS_PER_BLOCK;
-    if (N % MAX_ELEMENTS_PER_BLOCK != 0) {
-        block_num += 1;
-    }
-    int *d_sums, *d_sums_prefix_sum;  // 用来保存block数组和、数组和的前缀和
-    cudaMalloc(&d_sums, block_num * sizeof(int));
-    cudaMalloc(&d_sums_prefix_sum, block_num * sizeof(int));
-
-    parallel_large_scan_kernel<<<block_num, MAX_THREADS_PER_BLOCK>>>(d_data, d_prefix_sum, N, d_sums);
-
-    if (block_num != 1) {
-        recursive_scan(d_sums, d_sums_prefix_sum, block_num);
-        add_kernel<<<block_num, MAX_THREADS_PER_BLOCK>>>(d_prefix_sum, d_sums_prefix_sum, N);
-    }
-}
-
-
-// column_size: cell numbers in x-direction
-// num_columns: you knows it
-__global__ void columnWisePrefixScan(const int *d_input, int *d_output, int column_size, int num_columns) {
-    extern __shared__ int temp[];
-    int tid = threadIdx.x;
-    int column = blockIdx.x;
-
-
-    if (column >= num_columns) return;
-
-
-    if (tid < column_size) {
-        temp[tid] = d_input[column * column_size + tid];
-    } else {
-        temp[tid] = 0;
-    }
-    __syncthreads();
-
-
-    for (int stride = 1; stride < column_size; stride *= 2) {
-        int index = (tid + 1) * stride * 2 - 1;
-        if (index < column_size) {
-            temp[index] += temp[index - stride];
-        }
-        __syncthreads();
-    }
-
-
-    for (int stride = column_size / 4; stride > 0; stride /= 2) {
-        int index = (tid + 1) * stride * 2 - 1;
-        if (index + stride < column_size) {
-            temp[index + stride] += temp[index];
-        }
-        __syncthreads();
-    }
-
-
-    if (tid < column_size) {
-        d_output[column * column_size + tid] = temp[tid];
-    }
-}
-
-__global__ void sumGlobal(int *column_sum, int *global_sum, int *tri_offsets, int column_size, int num_columns) {
-    int tid = threadIdx.x;
-    int bid = blockIdx.x * blockDim.x;
-
-    if (tid >= column_size || bid >= num_columns) {
-        return;
-    }
-    tri_offsets[tid + bid * column_size] = column_sum[tid + bid * column_size] + global_sum[bid];
-}
-
-void Pass3(int *d_triCount, int *d_triOffsets, int *d_cubes_tri, dim3 dataShape) {
-
+void Pass3(int *d_cubes_tri, int *d_triOffsets, dim3 dataShape) {
     int column_size = dataShape.x - 1;
     int num_columns = (dataShape.y - 1) * (dataShape.z - 1);
-    int blockNum = (dataShape.y - 1) * (dataShape.z - 1);
+    int totalElements = column_size * num_columns;
 
-    // Get Prefix Sum Result for every cell line here
-    int *d_sum_temp;
-    CHECK_CUDA(cudaMalloc(&d_sum_temp, num_columns * sizeof(int)));
-    recursive_scan(d_triCount, d_sum_temp, blockNum);
+    // Determine temporary device storage requirements
+    void *d_temp_storage = NULL;
+    size_t temp_storage_bytes = 0;
+    cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, d_cubes_tri, d_triOffsets, totalElements);
 
-    cudaDeviceSynchronize();
+    // Allocate temporary storage
+    cudaMalloc(&d_temp_storage, temp_storage_bytes);
 
-    int *d_temp_ouput;
-    CHECK_CUDA(cudaMalloc(&d_temp_ouput, num_columns * column_size * sizeof(int)));
+    // Run inclusive prefix sum
+    cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, d_cubes_tri, d_triOffsets, totalElements);
 
-    int sharedMemSize = column_size * sizeof(int);
-    columnWisePrefixScan<<<num_columns, column_size, sharedMemSize>>>(d_cubes_tri, d_temp_ouput, column_size, blockNum);
+    // Clean up
+    cudaFree(d_temp_storage);
 
-    cudaDeviceSynchronize();
+    // Error checking
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("CUDA error: %s\n", cudaGetErrorString(error));
+    }
 
-    sumGlobal<<<num_columns, column_size>>>(d_temp_ouput, d_sum_temp, d_triOffsets, column_size, num_columns);
-
-    cudaDeviceSynchronize();
-
-    cudaFree(d_sum_temp);
-    cudaFree(d_temp_ouput);
+    // Optionally, verify results (first few elements)
+    int *h_result = new int[10];  // Just check first 10 elements
+    cudaMemcpy(h_result, d_triOffsets, 10 * sizeof(int), cudaMemcpyDeviceToHost);
+    printf("First 10 elements of prefix sum:\n");
+    for (int i = 0; i < 10; i++) {
+        printf("%d ", h_result[i]);
+    }
+    printf("\n");
+    delete[] h_result;
 }
-
 
 // ALL SAFE HERE!!!
 template<typename T>
@@ -1161,44 +1242,6 @@ void exportToCSV(const std::vector <Vertex> &vertices, const std::vector <Triang
     triangleFile.close();
 }
 
-void outputTriOffsetsAndCounts(const int *d_triOffsets, const int *d_triCount, int totalVoxels) {
-    std::vector<int> h_triOffsets(totalVoxels);
-    std::vector<int> h_triCount(totalVoxels);
-    std::string filename = "test.csv";
-
-    // Copy data from device to host
-    cudaError_t err = cudaMemcpy(h_triOffsets.data(), d_triOffsets, totalVoxels * sizeof(int), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        std::cerr << "Failed to copy triOffsets from device to host: " << cudaGetErrorString(err) << std::endl;
-        return;
-    }
-
-    err = cudaMemcpy(h_triCount.data(), d_triCount, totalVoxels * sizeof(int), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        std::cerr << "Failed to copy triCount from device to host: " << cudaGetErrorString(err) << std::endl;
-        return;
-    }
-
-    // Open file for writing
-    std::ofstream outFile(filename);
-    if (!outFile.is_open()) {
-        std::cerr << "Failed to open file: " << filename << std::endl;
-        return;
-    }
-
-    // Write header
-    outFile << "Index,TriOffset,TriCount\n";
-
-    // Write data
-    for (int i = 0; i < totalVoxels; ++i) {
-        outFile << i << "," << h_triOffsets[i] << "," << h_triCount[i] << "\n";
-    }
-
-    outFile.close();
-    std::cout << "TriOffsets and TriCounts have been written to " << filename << std::endl;
-}
-
-
 void printTriCountAndOffsets(int *d_triCount, int *d_triOffsets, dim3 dataShape) {
     int totalVoxels = (dataShape.x - 1) * (dataShape.y - 1) * (dataShape.z - 1);
     int numSlices = (dataShape.y - 1) * (dataShape.z - 1);
@@ -1283,43 +1326,52 @@ int main() {
         Pass2(d_edgeCases, d_leftTrim, d_rightTrim, d_triCount, d_cubeCases, d_leftTrim_c, d_rightTrim_c, dataShape,
               d_cubes_tri);
 
-        std::cout << "Executing Pass3..." << std::endl;
-        Pass3(d_triCount, d_triOffsets, d_cubes_tri, dataShape);
-        cudaDeviceSynchronize();
+        print_int(d_cubes_tri, totalVoxels);
+
+        // 研究了一下，感觉d_cubes_tri为空诶
+//        std::cout << "Executing Pass3..." << std::endl;
+//        Pass3(d_triCount, d_triOffsets, d_cubes_tri, dataShape);
+        // Pass3(d_cubes_tri, d_triOffsets, dataShape);
+//        print_int(d_cubes_tri, totalVoxels);
+//        cudaDeviceSynchronize();
+
+// 添加调试输出
+//        std::cout << "Printing debug information..." << std::endl;
+//        printTriCountAndOffsets(d_triCount, d_triOffsets, dataShape);
 
 
         // Allocate host memory
-        std::vector<int> h_triCount(totalVoxels);
-        std::vector<int> h_triOffsets(totalVoxels);
-
-        // Copy data from device to host
-        CHECK_CUDA(cudaMemcpy(h_triCount.data(), d_triCount, (dataShape.y - 1) * (dataShape.z - 1) * sizeof(int),
-                              cudaMemcpyDeviceToHost));
-        CHECK_CUDA(cudaMemcpy(h_triOffsets.data(), d_triOffsets, totalVoxels * sizeof(int), cudaMemcpyDeviceToHost));
-
-        // Calculate total triangles
-        int totalTriangles = h_triOffsets[totalVoxels - 1] + h_triCount[(dataShape.y - 1) * (dataShape.z - 1) - 1];
-
-        std::cout << "Total number of triangles: " << totalTriangles << std::endl;
-
-        // Now you can use totalTriangles to allocate memory for vertices and triangles
-        CHECK_CUDA(cudaMalloc(&d_vertices, totalTriangles * 3 * sizeof(Vertex)));
-        CHECK_CUDA(cudaMalloc(&d_triangles, totalTriangles * sizeof(Triangle)));
-
-        std::cout << "Executing Pass4..." << std::endl;
-
-
-        Pass4<float>(d_scalars, d_cubeCases, d_triOffsets, d_vertices, d_triangles, isovalue,
-                     dataShape);
-
-
-        std::cout << "Copying results back to host..." << std::endl;
-        std::vector <Vertex> hostVertices(totalTriangles * 3);
-        std::vector <Triangle> hostTriangles(totalTriangles);
-        CHECK_CUDA(cudaMemcpy(hostVertices.data(), d_vertices, totalTriangles * 3 * sizeof(Vertex),
-                              cudaMemcpyDeviceToHost));
-        CHECK_CUDA(cudaMemcpy(hostTriangles.data(), d_triangles, totalTriangles * sizeof(Triangle),
-                              cudaMemcpyDeviceToHost));
+//        std::vector<int> h_triCount(totalVoxels);
+//        std::vector<int> h_triOffsets(totalVoxels);
+//
+//        // Copy data from device to host
+//        CHECK_CUDA(cudaMemcpy(h_triCount.data(), d_triCount, (dataShape.y - 1) * (dataShape.z - 1) * sizeof(int),
+//                              cudaMemcpyDeviceToHost));
+//        CHECK_CUDA(cudaMemcpy(h_triOffsets.data(), d_triOffsets, totalVoxels * sizeof(int), cudaMemcpyDeviceToHost));
+//
+//        // Calculate total triangles
+//        int totalTriangles = h_triOffsets[totalVoxels - 1] + h_triCount[(dataShape.y - 1) * (dataShape.z - 1) - 1];
+//
+//        std::cout << "Total number of triangles: " << totalTriangles << std::endl;
+//
+//        // Now you can use totalTriangles to allocate memory for vertices and triangles
+//        CHECK_CUDA(cudaMalloc(&d_vertices, totalTriangles * 3 * sizeof(Vertex)));
+//        CHECK_CUDA(cudaMalloc(&d_triangles, totalTriangles * sizeof(Triangle)));
+//
+//        std::cout << "Executing Pass4..." << std::endl;
+//
+//
+//        Pass4<float>(d_scalars, d_cubeCases, d_triOffsets, d_vertices, d_triangles, isovalue,
+//                     dataShape);
+//
+//
+//        std::cout << "Copying results back to host..." << std::endl;
+//        std::vector <Vertex> hostVertices(totalTriangles * 3);
+//        std::vector <Triangle> hostTriangles(totalTriangles);
+//        CHECK_CUDA(cudaMemcpy(hostVertices.data(), d_vertices, totalTriangles * 3 * sizeof(Vertex),
+//                              cudaMemcpyDeviceToHost));
+//        CHECK_CUDA(cudaMemcpy(hostTriangles.data(), d_triangles, totalTriangles * sizeof(Triangle),
+//                              cudaMemcpyDeviceToHost));
 
 //        exportToCSV(hostVertices, hostTriangles);
 
@@ -1331,8 +1383,8 @@ int main() {
         cudaFree(d_rightTrim);
         cudaFree(d_triCount);
         cudaFree(d_triOffsets);
-        cudaFree(d_vertices);
-        cudaFree(d_triangles);
+//        cudaFree(d_vertices);
+//        cudaFree(d_triangles);
         cudaFree(d_cubes_tri);
 
         return 0;
